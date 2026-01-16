@@ -1,0 +1,58 @@
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Icon?
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+build/
+dist/
+.eggs/
+pip-wheel-metadata/
+.env
+.venv/
+venv/
+ENV/
+env/
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Test/coverage caches
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local output/caches
+output/
+tmp/
+temp/
+.cache/
+
+# Project data directories
+Source_docs/
+questions_cache/
+Distractors/
+context/
