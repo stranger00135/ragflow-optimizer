@@ -1,0 +1,95 @@
+# RAG Ingestion Parameter Optimizer Configuration
+
+# RAGFlow settings
+ragflow:
+  base_url: "${RAGFLOW_DOMAIN}"
+  api_key: "${RAGFLOW_TOKEN}"
+
+# LLM settings for question generation and relevance judgment
+llm:
+  provider: "deepseek"  # openai, dashscope, deepseek
+  model: "deepseek-chat"
+  api_key: "${DEEPSEEK_API_KEY}"
+
+# Paths
+paths:
+  source_docs: "Source_docs/"
+  distractors: "Distractors/"
+  output: "output/"
+  questions_cache: "questions_cache/"
+
+# Evaluation settings
+evaluation:
+  questions_per_folder: 5
+  top_k: 3  # Number of chunks to retrieve for evaluation
+  similarity_threshold: 0.2
+
+# Distractor KB settings
+distractor_kb:
+  name: "eval_distractor_v3"
+  ingest_preset: "general"
+
+# Phase 1: Preset Definitions
+presets:
+  general:
+    chunk_method: naive
+    chunk_token_num: 512
+    overlap_token: 50
+    auto_questions: 5
+    auto_keywords: 5
+    layout_recognize: "DeepDOC"
+
+  manual:
+    chunk_method: manual
+    chunk_token_num: 800
+    overlap_token: 50
+    toc_enhance: true
+    auto_questions: 0
+    auto_keywords: 5
+    layout_recognize: "DeepDOC"
+
+  qa:
+    chunk_method: qa
+    auto_questions: 0
+    auto_keywords: 3
+    layout_recognize: "DeepDOC"
+
+  table:  # Only used if folder contains Excel/CSV
+    chunk_method: table
+    chunk_token_num: 4096
+    auto_questions: 5
+    auto_keywords: 0
+    layout_recognize: "DeepDOC"
+
+# Phase 2: Parameter Search Space (per preset)
+optimization_spaces:
+  general:
+    - name: chunk_token_num
+      values: [256, 512, 768, 1024]
+    - name: auto_questions
+      values: [0, 3, 5]
+    - name: auto_keywords
+      values: [3, 5, 7]
+
+  manual:
+    - name: chunk_token_num
+      values: [400, 512, 800, 1024]
+    - name: toc_enhance
+      values: [true, false]
+    - name: auto_keywords
+      values: [3, 5, 7]
+
+  qa:
+    - name: auto_keywords
+      values: [0, 3, 5]
+
+  table:
+    - name: chunk_token_num
+      values: [2048, 4096, 8192]
+    - name: auto_questions
+      values: [0, 3, 5]
+
+# Retry settings
+retry:
+  max_retries: 3
+  backoff_base: 1  # seconds
