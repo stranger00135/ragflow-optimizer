@@ -1,4 +1,13 @@
-"""Relevance judge using LLM to evaluate chunk relevance to questions."""
+"""
+Relevance Judge - Uses LLM to evaluate if retrieved chunks answer questions.
+
+This module:
+1. Takes a question and retrieved chunk
+2. Asks LLM if the chunk contains relevant information
+3. Returns (is_relevant, rationale) for metrics calculation
+
+The rationale is returned in Chinese for Chinese document evaluation.
+"""
 
 import json
 from typing import Any, Dict, List, Optional, Tuple
@@ -47,21 +56,21 @@ class RelevanceJudge:
         Returns:
             Tuple of (is_relevant, rationale)
         """
-        prompt = f"""You are evaluating whether a retrieved text chunk contains information that helps answer a question.
+        prompt = f"""你正在评估一个检索到的文本片段是否包含有助于回答问题的信息。
 
-Question: {question}
+问题: {question}
 
-Retrieved Chunk:
+检索到的文本片段:
 {chunk_content[:2000]}
 
-Does this chunk contain information that helps answer the question? Consider:
-- Does it contain facts, procedures, or data directly related to the question?
-- Could a user find useful information here to answer their question?
+该文本片段是否包含有助于回答问题的信息？请考虑：
+- 是否包含与问题直接相关的事实、流程或数据？
+- 用户能否从中找到有用的信息来回答他们的问题？
 
-Respond with JSON only:
-{{"relevant": true/false, "rationale": "Brief explanation of why or why not"}}
+请用中文简要解释原因，并以JSON格式返回:
+{{"relevant": true/false, "rationale": "简要说明相关或不相关的原因（中文）"}}
 
-Only return valid JSON."""
+只返回有效的JSON格式。"""
 
         try:
             response = self.client.chat.completions.create(
@@ -111,7 +120,7 @@ Only return valid JSON."""
 
                 if chunk.get("from_distractor", False):
                     relevant = False
-                    rationale = "Chunk is from distractor KB, marked as irrelevant"
+                    rationale = "该文本片段来自干扰知识库，标记为不相关"
                 else:
                     relevant, rationale = self.judge_relevance(question, content)
 

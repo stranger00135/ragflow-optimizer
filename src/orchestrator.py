@@ -1,4 +1,17 @@
-"""Orchestrator for RAG ingestion parameter optimization."""
+"""
+Orchestrator - Main controller for RAG ingestion parameter optimization.
+
+This module coordinates the entire optimization process:
+1. Generates evaluation questions for each document folder
+2. Runs Phase 1 tournament across presets (general, manual, qa)
+3. Runs Phase 2 fine-tuning on the winning preset
+4. Produces summary reports with recommended configurations
+
+Key concepts:
+- Each folder in source_docs represents a document type
+- KB reuse: Upload files once, re-ingest with different configs
+- Tiebreaker: Same score -> faster ingestion time wins
+"""
 
 import atexit
 import json
@@ -85,6 +98,7 @@ class Orchestrator:
         # v4: Track current folder's temp KB for reuse
         self._current_folder_kb_id: Optional[str] = None
         self._current_folder_path: Optional[str] = None
+        self._current_embedding_model: Optional[str] = None
 
         # Setup signal handlers for graceful cleanup
         signal.signal(signal.SIGINT, _signal_handler)
@@ -297,6 +311,7 @@ class Orchestrator:
                     "is_baseline": is_baseline,
                     "config": preset_config,
                     "ingestion_details": ingestion_details,
+                    "embedding_model": self._current_embedding_model,
                     "metrics": None,
                     "questions": None,
                 }
@@ -343,6 +358,7 @@ class Orchestrator:
                 "is_baseline": is_baseline,
                 "config": preset_config,
                 "ingestion_details": ingestion_details,
+                "embedding_model": self._current_embedding_model,
                 "metrics": metrics,
                 "questions": enriched_results,
             }
@@ -367,6 +383,7 @@ class Orchestrator:
                 "status": "error",
                 "config": preset_config,
                 "error": str(e),
+                "embedding_model": self._current_embedding_model,
                 "ingestion_details": None,
                 "metrics": None,
             }
@@ -454,6 +471,7 @@ class Orchestrator:
         best_config = dict(baseline_config)
         best_score = 0.0
         best_ingestion_time = float('inf')
+        best_exp_id = None
 
         # Run baseline experiment
         baseline_result = self.run_single_experiment_v4(
@@ -471,6 +489,7 @@ class Orchestrator:
             metrics = baseline_result.get("metrics") or {}
             best_score = metrics.get("combined_score", 0.0)
             best_ingestion_time = (baseline_result.get("ingestion_details") or {}).get("ingestion_time_seconds", float('inf'))
+            best_exp_id = baseline_result.get("experiment_id")
 
         for param_spec in optimization_space:
             param_name = param_spec["name"]
@@ -481,6 +500,7 @@ class Orchestrator:
             best_param_value = current_config.get(param_name)
             best_param_score = best_score
             best_param_time = best_ingestion_time
+            best_param_exp_id = best_exp_id
 
             for value in param_values:
                 if value == current_config.get(param_name):
@@ -507,20 +527,22 @@ class Orchestrator:
                 score = metrics.get("combined_score", 0.0)
                 ingestion_time = (result.get("ingestion_details") or {}).get("ingestion_time_seconds", float('inf'))
 
-                # Tie-breaker: lower ingestion time
+                # Tie-breaker: lower ingestion time (faster is better)
                 if score > best_param_score or (score == best_param_score and ingestion_time < best_param_time):
                     best_param_score = score
                     best_param_value = value
                     best_param_time = ingestion_time
+                    best_param_exp_id = result.get("experiment_id")
 
             current_config[param_name] = best_param_value
             if best_param_score > best_score or (best_param_score == best_score and best_param_time < best_ingestion_time):
                 best_score = best_param_score
                 best_config = dict(current_config)
                 best_ingestion_time = best_param_time
+                best_exp_id = best_param_exp_id
 
-        print(f"  Phase 2 Best Score: {best_score:.4f}")
-        return best_config, results
+        print(f"  Phase 2 Best Score: {best_score:.4f} ({best_exp_id})")
+        return best_config, results, best_exp_id
 
     def run_folder_optimization_v4(
         self,
@@ -567,6 +589,7 @@ class Orchestrator:
         dataset_id = self.ingestion_engine.create_reusable_kb(kb_name)
         self._current_folder_kb_id = dataset_id
         self._current_folder_path = relative_path
+        self._current_embedding_model = self.client.get_embedding_model(dataset_id)
         self.created_kbs.append(dataset_id)
         self._save_cleanup_registry()
 
@@ -613,7 +636,7 @@ class Orchestrator:
                 }
             else:
                 # Run Phase 2 fine-tuning
-                best_config, phase2_results = self.run_phase2_finetuning_v4(
+                best_config, phase2_results, best_exp_id = self.run_phase2_finetuning_v4(
                     dataset_id=dataset_id,
                     relative_path=relative_path,
                     questions=questions,
@@ -626,6 +649,7 @@ class Orchestrator:
                     "status": "completed",
                     "winning_preset": winning_preset,
                     "recommended_config": best_config,
+                    "best_experiment_id": best_exp_id,
                     "phase1_experiments": len(phase1_results),
                     "phase2_experiments": len(phase2_results),
                     "questions_used": len(questions),
@@ -861,15 +885,20 @@ class Orchestrator:
                 folder_output = self._get_folder_output_path(folder)
                 experiments = self._load_folder_experiments(folder_output)
 
+                # Show embedding model if available
+                if experiments and experiments[0].get("embedding_model"):
+                    report_lines.append(f"**Embedding Model**: {experiments[0].get('embedding_model')}")
+                    report_lines.append("")
+
                 phase1_exps = [e for e in experiments if e.get("phase") == 1]
                 phase2_exps = [e for e in experiments if e.get("phase") == 2]
 
-                # Phase 1 table with v4 columns (Status, Files, Chunks)
+                # Phase 1 table with v4 columns (Status, Files, Chunks, Time)
                 if phase1_exps:
                     report_lines.append("### Phase 1: Preset Selection")
                     report_lines.append("")
-                    report_lines.append("| Exp ID | Preset | Status | Files | Chunks | Fail Rate | P@3 | MRR | Score |")
-                    report_lines.append("|--------|--------|--------|-------|--------|-----------|-----|-----|-------|")
+                    report_lines.append("| Exp ID | Preset | Status | Files | Chunks | Time(s) | Fail Rate | P@3 | MRR | Score |")
+                    report_lines.append("|--------|--------|--------|-------|--------|---------|-----------|-----|-----|-------|")
 
                     winner_exp = None
                     winner_score = -1
@@ -883,7 +912,9 @@ class Orchestrator:
                         total_files = ing.get("total_files", "-")
                         ingested_files = ing.get("ingested_files", "-")
                         chunk_count = ing.get("chunk_count", "-")
+                        ingestion_time = ing.get("ingestion_time_seconds", "-")
                         files_str = f"{ingested_files}/{total_files}" if isinstance(ingested_files, int) else "-"
+                        time_str = f"{ingestion_time:.1f}" if isinstance(ingestion_time, (int, float)) else "-"
 
                         if exp_status == "completed":
                             m = exp.get("metrics") or {}
@@ -894,14 +925,14 @@ class Orchestrator:
                                 winner_exp = exp_id
 
                             report_lines.append(
-                                f"| {exp_id} | {preset} | completed | {files_str} | {chunk_count} | "
+                                f"| {exp_id} | {preset} | completed | {files_str} | {chunk_count} | {time_str} | "
                                 f"{m.get('fail_rate', 0):.2f} | {m.get('precision_at_k', 0):.2f} | "
                                 f"{m.get('mrr', 0):.2f} | {score:.4f} |"
                             )
                         else:
                             # Disqualified or error
                             report_lines.append(
-                                f"| {exp_id} | {preset} | {exp_status} | {files_str} | {chunk_count} | "
+                                f"| {exp_id} | {preset} | {exp_status} | {files_str} | {chunk_count} | {time_str} | "
                                 f"- | - | - | - |"
                             )
 
@@ -922,12 +953,12 @@ class Orchestrator:
 
                     report_lines.append("")
 
-                # Phase 2 table with v4 columns
+                # Phase 2 table with v4 columns (including Time, overlap)
                 if phase2_exps:
                     report_lines.append(f"### Phase 2: Fine-Tuning ({result.get('winning_preset', 'N/A')})")
                     report_lines.append("")
-                    report_lines.append("| Exp ID | Baseline | Status | Files | Chunks | chunk_token | auto_q | auto_kw | Fail Rate | P@3 | MRR | Score |")
-                    report_lines.append("|--------|----------|--------|-------|--------|-------------|--------|---------|-----------|-----|-----|-------|")
+                    report_lines.append("| Exp ID | Baseline | Status | Files | Chunks | Time(s) | chunk_token | overlap | auto_q | auto_kw | Fail Rate | P@3 | MRR | Score |")
+                    report_lines.append("|--------|----------|--------|-------|--------|---------|-------------|---------|--------|---------|-----------|-----|-----|-------|")
 
                     best_exp = None
                     best_score = -1
@@ -942,7 +973,9 @@ class Orchestrator:
                         total_files = ing.get("total_files", "-")
                         ingested_files = ing.get("ingested_files", "-")
                         chunk_count = ing.get("chunk_count", "-")
+                        ingestion_time = ing.get("ingestion_time_seconds", "-")
                         files_str = f"{ingested_files}/{total_files}" if isinstance(ingested_files, int) else "-"
+                        time_str = f"{ingestion_time:.1f}" if isinstance(ingestion_time, (int, float)) else "-"
 
                         if exp_status == "completed":
                             m = exp.get("metrics") or {}
@@ -953,23 +986,27 @@ class Orchestrator:
                                 best_exp = exp_id
 
                             report_lines.append(
-                                f"| {exp_id} | {is_baseline} | completed | {files_str} | {chunk_count} | "
-                                f"{cfg.get('chunk_token_num', '-')} | {cfg.get('auto_questions', '-')} | "
-                                f"{cfg.get('auto_keywords', '-')} | {m.get('fail_rate', 0):.2f} | "
-                                f"{m.get('precision_at_k', 0):.2f} | {m.get('mrr', 0):.2f} | {score:.4f} |"
+                                f"| {exp_id} | {is_baseline} | completed | {files_str} | {chunk_count} | {time_str} | "
+                                f"{cfg.get('chunk_token_num', '-')} | {cfg.get('overlap_token', '-')} | "
+                                f"{cfg.get('auto_questions', '-')} | {cfg.get('auto_keywords', '-')} | "
+                                f"{m.get('fail_rate', 0):.2f} | {m.get('precision_at_k', 0):.2f} | "
+                                f"{m.get('mrr', 0):.2f} | {score:.4f} |"
                             )
                         else:
                             report_lines.append(
-                                f"| {exp_id} | {is_baseline} | {exp_status} | {files_str} | {chunk_count} | "
-                                f"{cfg.get('chunk_token_num', '-')} | {cfg.get('auto_questions', '-')} | "
-                                f"{cfg.get('auto_keywords', '-')} | - | - | - | - |"
+                                f"| {exp_id} | {is_baseline} | {exp_status} | {files_str} | {chunk_count} | {time_str} | "
+                                f"{cfg.get('chunk_token_num', '-')} | {cfg.get('overlap_token', '-')} | "
+                                f"{cfg.get('auto_questions', '-')} | {cfg.get('auto_keywords', '-')} | "
+                                f"- | - | - | - |"
                             )
 
                     report_lines.append("")
-                    report_lines.append(f"**Best Configuration: {best_exp} (Score: {best_score:.4f})**")
+                    # Use best_experiment_id from result if available (uses time tiebreaker)
+                    actual_best_exp = result.get("best_experiment_id", best_exp)
+                    report_lines.append(f"**Best Configuration: {actual_best_exp} (Score: {best_score:.4f})**")
                     report_lines.append("")
 
-                # Recommended config
+                # Recommended config (now guaranteed to match best_experiment_id)
                 if result.get("recommended_config"):
                     report_lines.append("### Recommended Configuration")
                     report_lines.append("")

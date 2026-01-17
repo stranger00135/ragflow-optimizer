@@ -15,8 +15,9 @@ def get_config() -> Config:
     """Load configuration from default paths."""
     project_root = Path(__file__).parent
     config_path = project_root / "config" / "config.yaml"
-    credentials_path = project_root / "context" / "credentials.txt"
-    return Config(str(config_path), str(credentials_path))
+    env_path = project_root / ".env"
+    # Pass env_path if exists, otherwise Config will auto-discover
+    return Config(str(config_path), str(env_path) if env_path.exists() else None)
 
 
 def cmd_run(args):
@@ -135,9 +136,12 @@ def cmd_test_api(args):
 
     project_root = Path(__file__).parent
     config_path = project_root / "config" / "config.yaml"
-    credentials_path = project_root / "context" / "credentials.txt"
+    env_path = project_root / ".env"
 
-    success = test_api(str(config_path), str(credentials_path))
+    success = test_api(
+        str(config_path),
+        str(env_path) if env_path.exists() else None,
+    )
     sys.exit(0 if success else 1)
 
 

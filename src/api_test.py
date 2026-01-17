@@ -2,17 +2,18 @@
 
 import sys
 from pathlib import Path
+from typing import Optional
 
 from .config_loader import Config
 from .ragflow_client import RAGFlowClient, RAGFlowAPIError
 
 
-def test_api(config_path: str, credentials_path: str) -> bool:
+def test_api(config_path: str, env_path: Optional[str] = None) -> bool:
     """Test all RAGFlow API operations.
 
     Args:
         config_path: Path to config.yaml
-        credentials_path: Path to credentials file
+        env_path: Optional path to .env file
 
     Returns:
         True if all tests pass
@@ -21,7 +22,7 @@ def test_api(config_path: str, credentials_path: str) -> bool:
     print("RAGFlow API Connectivity Test")
     print("=" * 60)
 
-    config = Config(config_path, credentials_path)
+    config = Config(config_path, env_path)
 
     client = RAGFlowClient(
         base_url=config.ragflow_base_url,
@@ -95,7 +96,10 @@ def test_api(config_path: str, credentials_path: str) -> bool:
 if __name__ == "__main__":
     project_root = Path(__file__).parent.parent
     config_path = project_root / "config" / "config.yaml"
-    credentials_path = project_root / "context" / "credentials.txt"
+    env_path = project_root / ".env"
 
-    success = test_api(str(config_path), str(credentials_path))
+    success = test_api(
+        str(config_path),
+        str(env_path) if env_path.exists() else None,
+    )
     sys.exit(0 if success else 1)

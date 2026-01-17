@@ -6,6 +6,24 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import yaml
+from dotenv import load_dotenv
+
+
+def load_env_file(env_path: Optional[str] = None) -> None:
+    """Load environment variables from .env file.
+
+    Args:
+        env_path: Optional path to .env file. If not provided,
+                  looks for .env in project root.
+    """
+    if env_path:
+        load_dotenv(env_path)
+    else:
+        # Auto-discover .env in project root
+        project_root = Path(__file__).parent.parent
+        default_env = project_root / ".env"
+        if default_env.exists():
+            load_dotenv(default_env)
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -23,26 +41,6 @@ def load_config(config_path: str) -> Dict[str, Any]:
     return yaml.safe_load(content)
 
 
-def load_credentials(credentials_path: str) -> Dict[str, str]:
-    """Load credentials from a file and set as environment variables."""
-    credentials = {}
-
-    with open(credentials_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-
-            if "=" in line:
-                key, value = line.split("=", 1)
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                credentials[key] = value
-                os.environ[key] = value
-
-    return credentials
-
-
 def get_project_root() -> Path:
     """Get the project root directory."""
     return Path(__file__).parent.parent
@@ -58,9 +56,9 @@ def resolve_path(config: Dict, key: str) -> Path:
 class Config:
     """Configuration wrapper for easy access."""
 
-    def __init__(self, config_path: str, credentials_path: Optional[str] = None):
-        if credentials_path:
-            load_credentials(credentials_path)
+    def __init__(self, config_path: str, env_path: Optional[str] = None):
+        # Load environment variables from .env file first
+        load_env_file(env_path)
 
         self.data = load_config(config_path)
         self.project_root = get_project_root()

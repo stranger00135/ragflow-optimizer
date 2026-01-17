@@ -93,6 +93,21 @@ class RAGFlowClient:
                 return ds
         return None
 
+    def get_dataset_by_id(self, dataset_id: str) -> Optional[Dict]:
+        """Get dataset info by ID."""
+        datasets = self.list_datasets()
+        for ds in datasets:
+            if ds.get("id") == dataset_id:
+                return ds
+        return None
+
+    def get_embedding_model(self, dataset_id: str) -> str:
+        """Get the embedding model used by a dataset."""
+        ds = self.get_dataset_by_id(dataset_id)
+        if ds:
+            return ds.get("embedding_model", "unknown")
+        return "unknown"
+
     def create_dataset(
         self,
         name: str,

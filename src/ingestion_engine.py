@@ -1,4 +1,19 @@
-"""Ingestion engine for managing document ingestion into RAGFlow."""
+"""
+Ingestion Engine - Manages document upload and parsing in RAGFlow.
+
+This module handles:
+1. Creating temporary knowledge bases for experiments
+2. Uploading documents (once per folder for efficiency)
+3. Re-ingesting with different parser configs
+4. Validating ingestion results (auto-disqualification rules)
+5. Cleaning up temporary KBs
+
+KB Reuse Strategy:
+- Create one temp KB per folder
+- Upload files once
+- For each experiment: update parser config -> re-trigger parsing
+- Delete temp KB when folder optimization completes
+"""
 
 import time
 from pathlib import Path
@@ -30,6 +45,7 @@ class IngestionEngine:
             parser_config["chunk_token_num"] = preset_config["chunk_token_num"]
 
         if "overlap_token" in preset_config:
+            parser_config["overlap_token"] = preset_config["overlap_token"]
             parser_config["delimiter"] = "\n"
 
         if "auto_questions" in preset_config:

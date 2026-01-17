@@ -1,4 +1,16 @@
-"""Question generator using LLM to create evaluation questions from folder content."""
+"""
+Question Generator - Creates evaluation questions from documents using LLM.
+
+This module:
+1. Reads document content from a folder
+2. Calls LLM to generate representative questions
+3. Caches questions to avoid regeneration
+
+Caching Strategy:
+- Questions are cached in questions_cache/ with folder path as key
+- Same folder always uses same questions for fair comparison
+- Use --regenerate to force new question generation
+"""
 
 import json
 import os

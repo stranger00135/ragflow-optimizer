@@ -1,4 +1,14 @@
-"""Metrics calculation for RAG evaluation."""
+"""
+Metrics - Calculates evaluation metrics for RAG retrieval quality.
+
+Metrics computed:
+- Fail Rate: % of questions where top-k has zero relevant chunks
+- Precision@K: Average % of relevant chunks in top-k
+- MRR (Mean Reciprocal Rank): Average of 1/rank of first relevant chunk
+- Combined Score: (1-FailRate)*0.4 + P@K*0.3 + MRR*0.3
+
+Lower fail rate and higher P@K/MRR indicate better retrieval quality.
+"""
 
 from typing import Any, Dict, List
 
