@@ -6,7 +6,7 @@ from pathlib import Path
 
 from src.config_loader import Config
 from src.orchestrator import Orchestrator
-from src.cleanup import cleanup_all_temp_kbs
+from src.cleanup import cleanup_all_temp_kbs, force_cleanup_all_temp_kbs
 from src.ragflow_client import RAGFlowClient
 from src.question_generator import QuestionGenerator
 
@@ -119,9 +119,12 @@ def cmd_cleanup(args):
         api_key=config.ragflow_api_key,
     )
 
-    print("Cleaning up temporary evaluation knowledge bases...")
-
-    deleted = cleanup_all_temp_kbs(client)
+    if args.force:
+        print("Force cleanup mode: removing ALL temporary KBs (recovery mode)...")
+        deleted = force_cleanup_all_temp_kbs(client)
+    else:
+        print("Cleaning up temporary evaluation knowledge bases...")
+        deleted = cleanup_all_temp_kbs(client)
 
     print(f"\nDeleted {len(deleted)} knowledge base(s)")
 
@@ -197,6 +200,11 @@ Examples:
     cleanup_parser = subparsers.add_parser(
         "cleanup",
         help="Remove temporary evaluation KBs",
+    )
+    cleanup_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force cleanup ALL temp KBs including from registry (recovery mode)",
     )
     cleanup_parser.set_defaults(func=cmd_cleanup)
 

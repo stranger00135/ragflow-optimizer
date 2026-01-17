@@ -1,6 +1,9 @@
 """Orchestrator for RAG ingestion parameter optimization."""
 
+import atexit
 import json
+import signal
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +18,22 @@ from .relevance_judge import RelevanceJudge
 from .retrieval_engine import RetrievalEngine
 
 
+# Global orchestrator reference for signal handler
+_active_orchestrator: Optional["Orchestrator"] = None
+
+
+def _signal_handler(signum, frame):
+    """Handle Ctrl+C and other termination signals."""
+    global _active_orchestrator
+    print("\n\nReceived termination signal. Cleaning up...")
+    if _active_orchestrator:
+        try:
+            _active_orchestrator.emergency_cleanup()
+        except Exception as e:
+            print(f"Cleanup error: {e}")
+    sys.exit(1)
+
+
 class Orchestrator:
     """Main orchestrator for the RAG ingestion parameter optimization process."""
 
@@ -24,7 +43,13 @@ class Orchestrator:
         ".ppt", ".pptx",
     }
 
+    # Cleanup registry file path
+    CLEANUP_REGISTRY_FILE = ".claude/cleanup_registry.json"
+
     def __init__(self, config: Config):
+        global _active_orchestrator
+        _active_orchestrator = self
+
         self.config = config
 
         self.client = RAGFlowClient(
@@ -56,6 +81,67 @@ class Orchestrator:
         self.distractor_kb_id: Optional[str] = None
         # Use fixed name for distractor KB so it persists across runs
         self.distractor_kb_name = config.distractor_kb_name
+
+        # v4: Track current folder's temp KB for reuse
+        self._current_folder_kb_id: Optional[str] = None
+        self._current_folder_path: Optional[str] = None
+
+        # Setup signal handlers for graceful cleanup
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+        atexit.register(self._atexit_cleanup)
+
+    def _atexit_cleanup(self):
+        """Cleanup handler for normal exit."""
+        # Don't do anything on normal exit - cleanup is explicit
+        pass
+
+    def _save_cleanup_registry(self) -> None:
+        """Save created KB IDs to registry file for recovery."""
+        registry_path = Path(self.CLEANUP_REGISTRY_FILE)
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+
+        registry = {
+            "run_id": self.run_id,
+            "created_at": datetime.now().isoformat(),
+            "kb_ids": self.created_kbs,
+            "distractor_kb_id": self.distractor_kb_id,
+        }
+
+        with open(registry_path, "w", encoding="utf-8") as f:
+            json.dump(registry, f, indent=2)
+
+    def _clear_cleanup_registry(self) -> None:
+        """Clear the cleanup registry after successful cleanup."""
+        registry_path = Path(self.CLEANUP_REGISTRY_FILE)
+        if registry_path.exists():
+            registry_path.unlink()
+
+    def emergency_cleanup(self) -> None:
+        """Emergency cleanup on termination - delete all temp KBs."""
+        print("Performing emergency cleanup...")
+        deleted = 0
+
+        # Clean up current folder KB
+        if self._current_folder_kb_id:
+            try:
+                self.ingestion_engine.cleanup_kb(self._current_folder_kb_id)
+                deleted += 1
+                print(f"  Deleted current folder KB")
+            except Exception:
+                pass
+
+        # Clean up all created KBs
+        for kb_id in self.created_kbs:
+            try:
+                self.ingestion_engine.cleanup_kb(kb_id)
+                deleted += 1
+            except Exception:
+                pass
+
+        # Clear registry
+        self._clear_cleanup_registry()
+        print(f"  Deleted {deleted} knowledge base(s)")
 
     def _next_experiment_id(self) -> str:
         """Generate next experiment ID."""
@@ -141,9 +227,9 @@ class Orchestrator:
 
         return self.distractor_kb_id
 
-    def run_single_experiment(
+    def run_single_experiment_v4(
         self,
-        folder_path: Path,
+        dataset_id: str,
         relative_path: str,
         preset_name: str,
         preset_config: Dict[str, Any],
@@ -151,10 +237,13 @@ class Orchestrator:
         phase: int,
         is_baseline: bool = False,
     ) -> Dict[str, Any]:
-        """Run a single experiment with given configuration.
+        """Run a single experiment using v4 KB reuse strategy.
+
+        v4 improvement: Uses existing KB with uploaded files, just re-ingests
+        with new parser config instead of creating new KB each time.
 
         Args:
-            folder_path: Absolute path to folder
+            dataset_id: Existing KB with uploaded files
             relative_path: Relative path for naming
             preset_name: Name of the preset being used
             preset_config: Configuration for this experiment
@@ -163,30 +252,65 @@ class Orchestrator:
             is_baseline: Whether this is the baseline for Phase 2
 
         Returns:
-            Experiment result dictionary
+            Experiment result dictionary with v4 fields (status, ingestion_details)
         """
         experiment_id = self._next_experiment_id()
-        kb_name = f"eval_{experiment_id}_{relative_path.replace('/', '_')[:30]}"
+        start_time = time.time()
 
         print(f"    Running {experiment_id}: {preset_name}")
 
         try:
-            dataset_id = self.ingestion_engine.create_kb_for_experiment(
-                name=kb_name,
-                preset_config=preset_config,
-            )
-            self.created_kbs.append(dataset_id)
-
-            ingestion_result = self.ingestion_engine.ingest_folder(
+            # v4: Re-ingest with new config instead of creating new KB
+            ingestion_result = self.ingestion_engine.reingest_with_config(
                 dataset_id=dataset_id,
-                folder_path=folder_path,
                 preset_config=preset_config,
-                wait_for_completion=True,
+                timeout=600,
             )
 
-            # Capture ingestion warnings and chunk count
-            ingestion_warnings = ingestion_result.get("warnings", [])
-            chunk_count = ingestion_result.get("chunk_count", 0)
+            ingestion_time = time.time() - start_time
+
+            # v4: Build ingestion_details per spec
+            ingestion_details = {
+                "total_files": ingestion_result.get("total_files", 0),
+                "ingested_files": ingestion_result.get("ingested_files", 0),
+                "failed_files": ingestion_result.get("failed_files", []),
+                "chunk_count": ingestion_result.get("chunk_count", 0),
+                "ingestion_time_seconds": round(ingestion_time, 2),
+            }
+
+            # v4: Validate ingestion and check for disqualification
+            is_valid, disqualification_reason = self.ingestion_engine.validate_ingestion(
+                ingestion_result
+            )
+
+            if not is_valid:
+                # Experiment disqualified - skip retrieval
+                print(f"      DISQUALIFIED: {disqualification_reason}")
+
+                experiment_result = {
+                    "experiment_id": experiment_id,
+                    "folder_path": relative_path,
+                    "phase": phase,
+                    "preset": preset_name,
+                    "status": "disqualified",
+                    "disqualification_reason": disqualification_reason,
+                    "is_baseline": is_baseline,
+                    "config": preset_config,
+                    "ingestion_details": ingestion_details,
+                    "metrics": None,
+                    "questions": None,
+                }
+
+                # Save experiment file
+                folder_output = self._get_folder_output_path(relative_path)
+                folder_output.mkdir(parents=True, exist_ok=True)
+                with open(folder_output / f"{experiment_id}.json", "w", encoding="utf-8") as f:
+                    json.dump(experiment_result, f, ensure_ascii=False, indent=2)
+
+                return experiment_result
+
+            # Ingestion valid - proceed with retrieval
+            chunk_count = ingestion_details["chunk_count"]
 
             retrieval_results = self.retrieval_engine.retrieve_for_evaluation(
                 questions=questions,
@@ -215,16 +339,13 @@ class Orchestrator:
                 "folder_path": relative_path,
                 "phase": phase,
                 "preset": preset_name,
+                "status": "completed",
                 "is_baseline": is_baseline,
                 "config": preset_config,
-                "chunk_count": chunk_count,
+                "ingestion_details": ingestion_details,
                 "metrics": metrics,
                 "questions": enriched_results,
             }
-
-            # Add warnings if any
-            if ingestion_warnings:
-                experiment_result["warnings"] = ingestion_warnings
 
             folder_output = self._get_folder_output_path(relative_path)
             folder_output.mkdir(parents=True, exist_ok=True)
@@ -243,35 +364,40 @@ class Orchestrator:
                 "folder_path": relative_path,
                 "phase": phase,
                 "preset": preset_name,
+                "status": "error",
                 "config": preset_config,
                 "error": str(e),
-                "metrics": {"combined_score": 0.0},
+                "ingestion_details": None,
+                "metrics": None,
             }
 
-    def run_phase1_tournament(
+    def run_phase1_tournament_v4(
         self,
+        dataset_id: str,
         folder_path: Path,
         relative_path: str,
         questions: List[Dict],
-    ) -> Tuple[str, Dict[str, Any], List[Dict]]:
-        """Run Phase 1 preset tournament for a folder.
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]], List[Dict]]:
+        """Run Phase 1 preset tournament for a folder using v4 KB reuse.
 
         Returns:
             Tuple of (winning_preset_name, winning_config, all_experiment_results)
+            Returns (None, None, results) if all presets disqualified
         """
         print(f"  Phase 1: Preset Selection for {relative_path}")
 
         applicable_presets = self._get_applicable_presets(folder_path)
         results = []
         best_score = -1.0
-        best_preset = "general"
-        best_config = self.config.get_preset("general")
+        best_preset = None
+        best_config = None
+        best_ingestion_time = float('inf')
 
         for preset_name in applicable_presets:
             preset_config = self.config.get_preset(preset_name)
 
-            result = self.run_single_experiment(
-                folder_path=folder_path,
+            result = self.run_single_experiment_v4(
+                dataset_id=dataset_id,
                 relative_path=relative_path,
                 preset_name=preset_name,
                 preset_config=preset_config,
@@ -280,24 +406,37 @@ class Orchestrator:
             )
             results.append(result)
 
-            score = result.get("metrics", {}).get("combined_score", 0.0)
-            if score > best_score:
+            # Only consider completed experiments for winner selection
+            if result.get("status") != "completed":
+                continue
+
+            metrics = result.get("metrics") or {}
+            score = metrics.get("combined_score", 0.0)
+            ingestion_time = (result.get("ingestion_details") or {}).get("ingestion_time_seconds", float('inf'))
+
+            # Select winner: highest score, tie-breaker is lower ingestion time
+            if score > best_score or (score == best_score and ingestion_time < best_ingestion_time):
                 best_score = score
                 best_preset = preset_name
                 best_config = preset_config
+                best_ingestion_time = ingestion_time
 
-        print(f"  Phase 1 Winner: {best_preset} (score: {best_score:.4f})")
+        if best_preset:
+            print(f"  Phase 1 Winner: {best_preset} (score: {best_score:.4f})")
+        else:
+            print(f"  Phase 1: ALL PRESETS DISQUALIFIED - skipping Phase 2")
+
         return best_preset, best_config, results
 
-    def run_phase2_finetuning(
+    def run_phase2_finetuning_v4(
         self,
-        folder_path: Path,
+        dataset_id: str,
         relative_path: str,
         questions: List[Dict],
         winning_preset: str,
         baseline_config: Dict[str, Any],
     ) -> Tuple[Dict[str, Any], List[Dict]]:
-        """Run Phase 2 parameter fine-tuning.
+        """Run Phase 2 parameter fine-tuning using v4 KB reuse.
 
         Returns:
             Tuple of (best_config, all_experiment_results)
@@ -314,9 +453,11 @@ class Orchestrator:
         current_config = dict(baseline_config)
         best_config = dict(baseline_config)
         best_score = 0.0
+        best_ingestion_time = float('inf')
 
-        baseline_result = self.run_single_experiment(
-            folder_path=folder_path,
+        # Run baseline experiment
+        baseline_result = self.run_single_experiment_v4(
+            dataset_id=dataset_id,
             relative_path=relative_path,
             preset_name=winning_preset,
             preset_config=current_config,
@@ -325,7 +466,11 @@ class Orchestrator:
             is_baseline=True,
         )
         results.append(baseline_result)
-        best_score = baseline_result.get("metrics", {}).get("combined_score", 0.0)
+
+        if baseline_result.get("status") == "completed":
+            metrics = baseline_result.get("metrics") or {}
+            best_score = metrics.get("combined_score", 0.0)
+            best_ingestion_time = (baseline_result.get("ingestion_details") or {}).get("ingestion_time_seconds", float('inf'))
 
         for param_spec in optimization_space:
             param_name = param_spec["name"]
@@ -335,6 +480,7 @@ class Orchestrator:
 
             best_param_value = current_config.get(param_name)
             best_param_score = best_score
+            best_param_time = best_ingestion_time
 
             for value in param_values:
                 if value == current_config.get(param_name):
@@ -343,8 +489,8 @@ class Orchestrator:
                 test_config = dict(current_config)
                 test_config[param_name] = value
 
-                result = self.run_single_experiment(
-                    folder_path=folder_path,
+                result = self.run_single_experiment_v4(
+                    dataset_id=dataset_id,
                     relative_path=relative_path,
                     preset_name=winning_preset,
                     preset_config=test_config,
@@ -353,31 +499,48 @@ class Orchestrator:
                 )
                 results.append(result)
 
-                score = result.get("metrics", {}).get("combined_score", 0.0)
-                if score > best_param_score:
+                # Only consider completed experiments
+                if result.get("status") != "completed":
+                    continue
+
+                metrics = result.get("metrics") or {}
+                score = metrics.get("combined_score", 0.0)
+                ingestion_time = (result.get("ingestion_details") or {}).get("ingestion_time_seconds", float('inf'))
+
+                # Tie-breaker: lower ingestion time
+                if score > best_param_score or (score == best_param_score and ingestion_time < best_param_time):
                     best_param_score = score
                     best_param_value = value
+                    best_param_time = ingestion_time
 
             current_config[param_name] = best_param_value
-            if best_param_score > best_score:
+            if best_param_score > best_score or (best_param_score == best_score and best_param_time < best_ingestion_time):
                 best_score = best_param_score
                 best_config = dict(current_config)
+                best_ingestion_time = best_param_time
 
         print(f"  Phase 2 Best Score: {best_score:.4f}")
         return best_config, results
 
-    def run_folder_optimization(
+    def run_folder_optimization_v4(
         self,
         folder_path: Path,
         relative_path: str,
     ) -> Dict[str, Any]:
-        """Run full optimization for a single folder.
+        """Run full optimization for a single folder using v4 KB reuse.
+
+        v4 improvements:
+        - Create single temp KB per folder
+        - Upload files once
+        - Re-ingest with different configs for each experiment
+        - Clean up KB after folder completes
 
         Returns:
             Dict with folder results including winning config
         """
         print(f"\nOptimizing: {relative_path}")
 
+        # Generate/load questions
         questions_data = self.question_generator.generate_questions(
             folder_path=folder_path,
             relative_path=relative_path,
@@ -396,35 +559,96 @@ class Orchestrator:
 
         print(f"  Using {len(questions)} questions")
 
-        winning_preset, winning_config, phase1_results = self.run_phase1_tournament(
+        # v4: Create single reusable KB for this folder
+        import hashlib
+        folder_hash = hashlib.md5(relative_path.encode()).hexdigest()[:8]
+        kb_name = f"eval_temp_{folder_hash}"
+
+        dataset_id = self.ingestion_engine.create_reusable_kb(kb_name)
+        self._current_folder_kb_id = dataset_id
+        self._current_folder_path = relative_path
+        self.created_kbs.append(dataset_id)
+        self._save_cleanup_registry()
+
+        # v4: Upload files once
+        print(f"  Uploading files to temp KB...")
+        upload_result = self.ingestion_engine.upload_folder_once(
+            dataset_id=dataset_id,
             folder_path=folder_path,
-            relative_path=relative_path,
-            questions=questions,
         )
 
-        best_config, phase2_results = self.run_phase2_finetuning(
-            folder_path=folder_path,
-            relative_path=relative_path,
-            questions=questions,
-            winning_preset=winning_preset,
-            baseline_config=winning_config,
-        )
+        if upload_result["uploaded_files"] == 0:
+            print(f"  No files uploaded, skipping folder")
+            # Clean up KB
+            self.ingestion_engine.cleanup_kb(dataset_id)
+            self.created_kbs.remove(dataset_id)
+            self._current_folder_kb_id = None
+            return {
+                "folder_path": relative_path,
+                "status": "skipped",
+                "reason": f"No files uploaded ({upload_result['total_files']} files found, all failed)",
+            }
 
-        return {
-            "folder_path": relative_path,
-            "status": "completed",
-            "winning_preset": winning_preset,
-            "recommended_config": best_config,
-            "phase1_experiments": len(phase1_results),
-            "phase2_experiments": len(phase2_results),
-            "questions_used": len(questions),
-        }
+        print(f"  Uploaded {upload_result['uploaded_files']}/{upload_result['total_files']} files")
+
+        try:
+            # Run Phase 1 tournament
+            winning_preset, winning_config, phase1_results = self.run_phase1_tournament_v4(
+                dataset_id=dataset_id,
+                folder_path=folder_path,
+                relative_path=relative_path,
+                questions=questions,
+            )
+
+            # Check if all presets disqualified
+            if winning_preset is None:
+                print(f"  All presets disqualified, skipping Phase 2")
+                result = {
+                    "folder_path": relative_path,
+                    "status": "all_disqualified",
+                    "reason": "All Phase 1 presets failed ingestion validation",
+                    "phase1_experiments": len(phase1_results),
+                    "phase2_experiments": 0,
+                    "questions_used": len(questions),
+                }
+            else:
+                # Run Phase 2 fine-tuning
+                best_config, phase2_results = self.run_phase2_finetuning_v4(
+                    dataset_id=dataset_id,
+                    relative_path=relative_path,
+                    questions=questions,
+                    winning_preset=winning_preset,
+                    baseline_config=winning_config,
+                )
+
+                result = {
+                    "folder_path": relative_path,
+                    "status": "completed",
+                    "winning_preset": winning_preset,
+                    "recommended_config": best_config,
+                    "phase1_experiments": len(phase1_results),
+                    "phase2_experiments": len(phase2_results),
+                    "questions_used": len(questions),
+                }
+
+        finally:
+            # v4: Clean up folder's temp KB after all experiments
+            print(f"  Cleaning up folder temp KB...")
+            self.ingestion_engine.cleanup_kb(dataset_id)
+            if dataset_id in self.created_kbs:
+                self.created_kbs.remove(dataset_id)
+            self._current_folder_kb_id = None
+            self._save_cleanup_registry()
+
+        return result
 
     def run_full_optimization(
         self,
         target_folder: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run optimization for all folders or a specific folder.
+
+        Uses v4 KB reuse strategy for efficiency.
 
         Args:
             target_folder: Optional specific folder path to process
@@ -435,7 +659,7 @@ class Orchestrator:
         self.run_output_path.mkdir(parents=True, exist_ok=True)
 
         print(f"\n{'='*60}")
-        print(f"RAG Ingestion Parameter Optimizer")
+        print(f"RAG Ingestion Parameter Optimizer (v4)")
         print(f"Run ID: {self.run_id}")
         print(f"{'='*60}\n")
 
@@ -456,7 +680,8 @@ class Orchestrator:
         results = []
         for folder_path, relative_path in folders:
             try:
-                result = self.run_folder_optimization(folder_path, relative_path)
+                # Use v4 method with KB reuse
+                result = self.run_folder_optimization_v4(folder_path, relative_path)
                 results.append(result)
             except Exception as e:
                 print(f"  ERROR processing {relative_path}: {e}")
@@ -465,6 +690,15 @@ class Orchestrator:
                     "status": "error",
                     "error": str(e),
                 })
+                # Ensure cleanup on error
+                if self._current_folder_kb_id:
+                    try:
+                        self.ingestion_engine.cleanup_kb(self._current_folder_kb_id)
+                        if self._current_folder_kb_id in self.created_kbs:
+                            self.created_kbs.remove(self._current_folder_kb_id)
+                    except Exception:
+                        pass
+                    self._current_folder_kb_id = None
 
         summary = {
             "run_id": self.run_id,
@@ -472,13 +706,17 @@ class Orchestrator:
             "completed": sum(1 for r in results if r.get("status") == "completed"),
             "errors": sum(1 for r in results if r.get("status") == "error"),
             "skipped": sum(1 for r in results if r.get("status") == "skipped"),
+            "all_disqualified": sum(1 for r in results if r.get("status") == "all_disqualified"),
             "folder_results": results,
         }
 
         with open(self.run_output_path / "summary_report.json", "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
 
-        self._generate_markdown_report(results)
+        self._generate_markdown_report_v4(results)
+
+        # Clear cleanup registry on successful completion
+        self._clear_cleanup_registry()
 
         return summary
 
@@ -603,6 +841,156 @@ class Orchestrator:
                 continue
         return experiments
 
+    def _generate_markdown_report_v4(self, results: List[Dict]) -> None:
+        """Generate v4 markdown summary report with ingestion status columns."""
+        report_lines = [
+            f"# Optimization Report",
+            f"Run ID: {self.run_id}",
+            f"",
+        ]
+
+        for result in results:
+            folder = result.get("folder_path", "Unknown")
+            status = result.get("status", "unknown")
+
+            report_lines.append(f"## {folder}")
+            report_lines.append("")
+
+            if status in ("completed", "all_disqualified"):
+                # Load experiment files for this folder
+                folder_output = self._get_folder_output_path(folder)
+                experiments = self._load_folder_experiments(folder_output)
+
+                phase1_exps = [e for e in experiments if e.get("phase") == 1]
+                phase2_exps = [e for e in experiments if e.get("phase") == 2]
+
+                # Phase 1 table with v4 columns (Status, Files, Chunks)
+                if phase1_exps:
+                    report_lines.append("### Phase 1: Preset Selection")
+                    report_lines.append("")
+                    report_lines.append("| Exp ID | Preset | Status | Files | Chunks | Fail Rate | P@3 | MRR | Score |")
+                    report_lines.append("|--------|--------|--------|-------|--------|-----------|-----|-----|-------|")
+
+                    winner_exp = None
+                    winner_score = -1
+                    for exp in sorted(phase1_exps, key=lambda x: x.get("experiment_id", "")):
+                        exp_id = exp.get("experiment_id", "")
+                        preset = exp.get("preset", "")
+                        exp_status = exp.get("status", "unknown")
+
+                        # Get ingestion details
+                        ing = exp.get("ingestion_details") or {}
+                        total_files = ing.get("total_files", "-")
+                        ingested_files = ing.get("ingested_files", "-")
+                        chunk_count = ing.get("chunk_count", "-")
+                        files_str = f"{ingested_files}/{total_files}" if isinstance(ingested_files, int) else "-"
+
+                        if exp_status == "completed":
+                            m = exp.get("metrics") or {}
+                            score = m.get("combined_score", 0)
+
+                            if score > winner_score:
+                                winner_score = score
+                                winner_exp = exp_id
+
+                            report_lines.append(
+                                f"| {exp_id} | {preset} | completed | {files_str} | {chunk_count} | "
+                                f"{m.get('fail_rate', 0):.2f} | {m.get('precision_at_k', 0):.2f} | "
+                                f"{m.get('mrr', 0):.2f} | {score:.4f} |"
+                            )
+                        else:
+                            # Disqualified or error
+                            report_lines.append(
+                                f"| {exp_id} | {preset} | {exp_status} | {files_str} | {chunk_count} | "
+                                f"- | - | - | - |"
+                            )
+
+                    report_lines.append("")
+
+                    if result.get("winning_preset"):
+                        report_lines.append(f"**Phase 1 Winner: {result.get('winning_preset')} ({winner_exp})**")
+                    else:
+                        report_lines.append("**Phase 1: All presets disqualified**")
+
+                    # Add notes for disqualified experiments
+                    disqualified = [e for e in phase1_exps if e.get("status") == "disqualified"]
+                    if disqualified:
+                        report_lines.append("")
+                        for exp in disqualified:
+                            reason = exp.get("disqualification_reason", "Unknown reason")
+                            report_lines.append(f"**Note: {exp.get('preset')} preset disqualified - {reason}**")
+
+                    report_lines.append("")
+
+                # Phase 2 table with v4 columns
+                if phase2_exps:
+                    report_lines.append(f"### Phase 2: Fine-Tuning ({result.get('winning_preset', 'N/A')})")
+                    report_lines.append("")
+                    report_lines.append("| Exp ID | Baseline | Status | Files | Chunks | chunk_token | auto_q | auto_kw | Fail Rate | P@3 | MRR | Score |")
+                    report_lines.append("|--------|----------|--------|-------|--------|-------------|--------|---------|-----------|-----|-----|-------|")
+
+                    best_exp = None
+                    best_score = -1
+                    for exp in sorted(phase2_exps, key=lambda x: x.get("experiment_id", "")):
+                        cfg = exp.get("config", {})
+                        exp_id = exp.get("experiment_id", "")
+                        is_baseline = "✓" if exp.get("is_baseline") else ""
+                        exp_status = exp.get("status", "unknown")
+
+                        # Get ingestion details
+                        ing = exp.get("ingestion_details") or {}
+                        total_files = ing.get("total_files", "-")
+                        ingested_files = ing.get("ingested_files", "-")
+                        chunk_count = ing.get("chunk_count", "-")
+                        files_str = f"{ingested_files}/{total_files}" if isinstance(ingested_files, int) else "-"
+
+                        if exp_status == "completed":
+                            m = exp.get("metrics") or {}
+                            score = m.get("combined_score", 0)
+
+                            if score > best_score:
+                                best_score = score
+                                best_exp = exp_id
+
+                            report_lines.append(
+                                f"| {exp_id} | {is_baseline} | completed | {files_str} | {chunk_count} | "
+                                f"{cfg.get('chunk_token_num', '-')} | {cfg.get('auto_questions', '-')} | "
+                                f"{cfg.get('auto_keywords', '-')} | {m.get('fail_rate', 0):.2f} | "
+                                f"{m.get('precision_at_k', 0):.2f} | {m.get('mrr', 0):.2f} | {score:.4f} |"
+                            )
+                        else:
+                            report_lines.append(
+                                f"| {exp_id} | {is_baseline} | {exp_status} | {files_str} | {chunk_count} | "
+                                f"{cfg.get('chunk_token_num', '-')} | {cfg.get('auto_questions', '-')} | "
+                                f"{cfg.get('auto_keywords', '-')} | - | - | - | - |"
+                            )
+
+                    report_lines.append("")
+                    report_lines.append(f"**Best Configuration: {best_exp} (Score: {best_score:.4f})**")
+                    report_lines.append("")
+
+                # Recommended config
+                if result.get("recommended_config"):
+                    report_lines.append("### Recommended Configuration")
+                    report_lines.append("")
+                    report_lines.append("```json")
+                    report_lines.append(json.dumps(result.get("recommended_config", {}), indent=2))
+                    report_lines.append("```")
+
+            elif status == "error":
+                report_lines.append(f"**Status**: Error")
+                report_lines.append(f"**Error**: {result.get('error', 'Unknown')}")
+            else:
+                report_lines.append(f"**Status**: {status}")
+                report_lines.append(f"**Reason**: {result.get('reason', 'Unknown')}")
+
+            report_lines.append("")
+            report_lines.append("---")
+            report_lines.append("")
+
+        with open(self.run_output_path / "summary_report.md", "w", encoding="utf-8") as f:
+            f.write("\n".join(report_lines))
+
     def cleanup(self, include_distractor: bool = False) -> None:
         """Clean up created knowledge bases."""
         print("\nCleaning up temporary knowledge bases...")
@@ -620,4 +1008,5 @@ class Orchestrator:
                 pass
 
         self.created_kbs = []
+        self._clear_cleanup_registry()
         print("Cleanup complete")
