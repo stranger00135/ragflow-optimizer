@@ -1,4 +1,150 @@
-# RAG 摄取参数优化器
+# RAG Ingestion Parameter Optimizer
+
+> Automatically discover the best chunking parameters for each document type and improve your RAG retrieval quality.
+
+**In one sentence**: Given a set of documents, this tool tests different chunking strategies (chunk_size, overlap, auto Q&A, etc.) and finds the configuration that yields the best retrieval performance.
+
+---
+
+## Why this tool?
+
+When building RAG applications, chunking parameters have a huge impact on retrieval quality:
+
+| Issue | Impact |
+|-------|--------|
+| chunk_size too small | Lost context, incomplete answers |
+| chunk_size too large | Too much noise, relevant content diluted |
+| Picking parameters by feel | No measurable evaluation, blind optimization |
+
+**This tool runs automated experiments** to find the best configuration for each document type.
+
+---
+
+## Features
+
+- **Fully automated optimization**: Two-phase strategy (preset screening + parameter fine-tuning)
+- **Rigorous evaluation**: LLM-based relevance judgment with Precision@3, MRR, fail rate, and combined score
+- **Noise-resilient testing**: Injects distractor documents to test chunking robustness
+- **Per-folder optimization**: Different document types get different optimal configs
+- **Efficient execution**: KB reuse—upload files once, re-chunk multiple times
+
+---
+
+## Quick start
+
+### 1. Environment
+
+```bash
+git clone <repo-url>
+cd ragflow_eval_v3
+pip install -r requirements.txt
+```
+
+### 2. Configure credentials
+
+Copy `.env.example` to `.env` and fill in your API keys:
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env`:
+
+```env
+# RAGFlow server and API token
+RAGFLOW_DOMAIN="http://your-ragflow-server/"
+RAGFLOW_TOKEN="ragflow-xxx-your-token"
+
+# LLM API key (choose one according to config.yaml provider)
+OPENAI_API_KEY="sk-xxx"
+# or DASHSCOPE_API_KEY="sk-xxx"
+# or DEEPSEEK_API_KEY="sk-xxx"
+```
+
+### 3. Prepare documents
+
+Put documents under `source_docs/`. **Each leaf folder represents one document type** with similar structure; the tool finds an optimal config per type.
+
+Example layout:
+
+```
+source_docs/
+├── HR/
+│   └── Employee_Handbook/     ← one type: policy docs
+│       ├── overtime_policy.pdf
+│       └── dress_code.docx
+└── Quality/
+    └── SOPs/                  ← another type: procedure docs
+        └── coating_sop.pdf
+
+Distractors/                   # Noise documents for robustness testing
+└── random_news.pdf
+```
+
+### 4. Run optimization
+
+```bash
+# Test API connectivity
+python main.py test-api
+
+# Full optimization
+python main.py run
+
+# Single folder only
+python main.py run --folder "HR/Employee_Handbook"
+```
+
+### 5. Results
+
+Output is under `output/run_YYYYMMDD_HHMMSS/`:
+
+- `summary_report.md` — human-readable summary  
+- `summary_report.json` — machine-readable results  
+- Per-folder `exp_*.json` — experiment details and retrieval results  
+
+---
+
+## How it works
+
+- **Phase 1 (Preset selection)**: Compare presets (e.g. general, manual, QA). The best-performing preset wins.
+- **Phase 2 (Fine-tuning)**: Tune parameters (chunk_token_num, auto_questions, auto_keywords, etc.) for the winning preset.
+- **Tiebreaker**: If scores are equal, the config with **faster ingestion** wins.
+
+Evaluation uses an LLM to judge relevance of retrieved chunks and computes **Fail Rate**, **Precision@3**, **MRR**, and a **combined score**.
+
+---
+
+## Configuration
+
+Main config: `config/config.yaml`. Use `${VAR}` for values that come from `.env` (e.g. `${RAGFLOW_DOMAIN}`, `${OPENAI_API_KEY}`). Never commit `.env`; keep secrets in environment or `.env` only.
+
+---
+
+## Security (for public release)
+
+- **Secrets**: No API keys or tokens are hardcoded. All credentials are read from environment variables via `.env` (and `.env` is in `.gitignore`). Use `.env.example` as a template only.
+- **Path handling**: The `--folder` argument is validated so paths stay under the configured source-docs directory (no path traversal).
+- **Dependencies**: `requirements.txt` pins versions; review and update periodically for security advisories.
+- **Recommendations**: (1) Do not commit `.env`. (2) Add `.claude/` to `.gitignore` if you do not want to publish internal project rules. (3) Run the tool in a dedicated environment with minimal permissions.
+
+---
+
+## Command reference
+
+```bash
+python main.py run                           # Full optimization
+python main.py run --folder "path/to/folder" # Single folder
+python main.py run --keep-kbs                # Keep temp KBs (debug)
+python main.py generate-questions            # Generate questions only
+python main.py generate-questions --regenerate
+python main.py cleanup                       # Remove temp KBs
+python main.py cleanup --force               # Force cleanup all temp KBs
+python main.py test-api                      # Test API connectivity
+```
+
+---
+
+# RAG 摄取参数优化器（中文）
 
 > 自动发现每个文档类型的最佳分块参数配置，让你的 RAG 检索质量显著提升
 

@@ -53,6 +53,10 @@ temp/
 
 # Project data directories
 Source_docs/
+source_docs/
 questions_cache/
 Distractors/
 context/
+
+# Internal / runtime (do not publish)
+.claude/

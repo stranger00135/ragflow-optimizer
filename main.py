@@ -83,8 +83,14 @@ def cmd_generate_questions(args):
         return folders
 
     if args.folder:
-        folder_path = source_path / args.folder
-        if not folder_path.exists():
+        folder_path = (source_path / args.folder).resolve()
+        source_resolved = source_path.resolve()
+        try:
+            folder_path.relative_to(source_resolved)
+        except ValueError:
+            print("ERROR: Folder path must be inside source_docs (path traversal not allowed).")
+            sys.exit(1)
+        if not folder_path.exists() or not folder_path.is_dir():
             print(f"ERROR: Folder not found: {args.folder}")
             sys.exit(1)
         folders = [(folder_path, args.folder)]

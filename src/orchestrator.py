@@ -692,8 +692,15 @@ class Orchestrator:
         self.setup_distractor_kb()
 
         if target_folder:
-            folder_path = self.config.source_docs_path / target_folder
-            if not folder_path.exists():
+            source_resolved = self.config.source_docs_path.resolve()
+            folder_path = (self.config.source_docs_path / target_folder).resolve()
+            try:
+                folder_path.relative_to(source_resolved)
+            except ValueError:
+                raise ValueError(
+                    "Folder path must be inside source_docs (path traversal not allowed)."
+                )
+            if not folder_path.exists() or not folder_path.is_dir():
                 raise ValueError(f"Folder not found: {target_folder}")
             folders = [(folder_path, target_folder)]
         else:
