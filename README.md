@@ -118,6 +118,35 @@ Evaluation uses an LLM to judge relevance of retrieved chunks and computes **Fai
 
 Main config: `config/config.yaml`. Use `${VAR}` for values that come from `.env` (e.g. `${RAGFLOW_DOMAIN}`, `${OPENAI_API_KEY}`). Never commit `.env`; keep secrets in environment or `.env` only.
 
+### Backend Selection
+
+The optimizer supports multiple RAG backends. Configure in `config/config.yaml`:
+
+```yaml
+backend:
+  type: "ragflow"  # ragflow | openwebui
+
+  ragflow:
+    base_url: "${RAGFLOW_DOMAIN}"
+    api_key: "${RAGFLOW_TOKEN}"
+
+  openwebui:
+    base_url: "${OPENWEBUI_URL}"
+    api_key: "${OPENWEBUI_API_KEY}"
+```
+
+Or override via CLI:
+
+```bash
+# Use OpenWebUI backend
+python main.py run --backend openwebui
+
+# Test OpenWebUI connectivity
+python main.py test-api --backend openwebui
+```
+
+**Note**: OpenWebUI chunking parameters are set at the instance level (Admin Settings), not per-knowledge-base. For full optimization with OpenWebUI, configure chunk settings in the OpenWebUI admin panel.
+
 ---
 
 ## Security (for public release)
@@ -132,15 +161,90 @@ Main config: `config/config.yaml`. Use `${VAR}` for values that come from `.env`
 ## Command reference
 
 ```bash
-python main.py run                           # Full optimization
-python main.py run --folder "path/to/folder" # Single folder
-python main.py run --keep-kbs                # Keep temp KBs (debug)
-python main.py generate-questions            # Generate questions only
+python main.py run                               # Full optimization
+python main.py run --folder "path/to/folder"     # Single folder
+python main.py run --keep-kbs                    # Keep temp KBs (debug)
+python main.py run --backend openwebui           # Use OpenWebUI backend
+python main.py generate-questions                # Generate questions only
 python main.py generate-questions --regenerate
-python main.py cleanup                       # Remove temp KBs
-python main.py cleanup --force               # Force cleanup all temp KBs
-python main.py test-api                      # Test API connectivity
+python main.py cleanup                           # Remove temp KBs
+python main.py cleanup --force                   # Force cleanup all temp KBs
+python main.py test-api                          # Test API connectivity
+python main.py test-api --backend openwebui      # Test OpenWebUI API
 ```
+
+---
+
+## Web UI
+
+The RAGFlow Optimizer includes a Streamlit-based web interface for easier interaction.
+
+### Running the UI
+
+```bash
+# Install dependencies (if not already installed)
+pip install -r requirements.txt
+
+# Start the UI
+streamlit run ui/app.py
+```
+
+The UI will open in your browser at `http://localhost:8501`.
+
+### UI Pages
+
+#### 1. Configuration Page
+
+Configure all settings through a user-friendly form:
+
+- **RAGFlow Settings**: Domain URL and API token
+- **LLM Settings**: Provider selection (OpenAI, DeepSeek, DashScope), model name, API key
+- **Paths**: Source documents, distractors, output, and cache paths
+- **Evaluation**: Questions per folder, top-k, similarity threshold
+
+Features:
+- **Test Connectivity** button to verify API connections
+- **Save Configuration** button to persist changes
+
+#### 2. Run Optimization Page
+
+Execute optimization runs with real-time monitoring:
+
+- **Folder Selector**: Choose a specific folder or run on all folders
+- **Keep KBs**: Option to retain temporary knowledge bases for debugging
+- **Start/Cancel**: Control the optimization process
+- **Progress Display**: Real-time progress bar and status metrics
+- **Log Output**: Scrollable log with timestamped messages
+
+The optimization runs in a background thread, allowing you to navigate to other pages while it executes.
+
+#### 3. Results Viewer Page
+
+Browse and analyze optimization results:
+
+- **Run Selector**: Choose from previous optimization runs
+- **Summary Cards**: Overview of completed/error/skipped folders
+- **Folder Details**: Expandable sections for each processed folder
+- **Phase 1 Table**: Preset comparison with metrics
+- **Phase 2 Table**: Parameter fine-tuning results
+- **Metrics Charts**: Bar charts and radar charts for visual comparison
+- **Question Details**: Drill down into individual question retrieval results
+- **Recommended Config**: View and copy the optimal configuration
+
+### UI Verification
+
+To verify the UI installation:
+
+```bash
+./scripts/verify_ui
+```
+
+This script checks:
+1. Streamlit and Plotly are installed
+2. All UI files exist
+3. Python syntax is valid
+4. Unit tests pass
+5. App starts successfully
 
 ---
 
