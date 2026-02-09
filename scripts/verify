@@ -1,0 +1,48 @@
+#!/bin/bash
+# Verification script for RAG Optimizer
+
+set -e
+
+echo "=== RAG Optimizer Verification ==="
+echo ""
+
+cd "$(dirname "$0")/.."
+
+# 1. Check Python syntax
+echo "[1/4] Checking Python syntax..."
+python -m py_compile src/backends/base.py \
+    src/backends/ragflow_backend.py \
+    src/backends/openwebui_backend.py \
+    src/backends/registry.py \
+    src/config_loader.py \
+    src/orchestrator.py \
+    main.py
+echo "  Syntax: OK"
+echo ""
+
+# 2. Check imports
+echo "[2/4] Checking module imports..."
+python -c "from src.backends.base import RAGBackend, BackendError"
+python -c "from src.backends.ragflow_backend import RAGFlowBackend"
+python -c "from src.backends.openwebui_backend import OpenWebUIBackend"
+python -c "from src.backends.registry import get_backend"
+python -c "from src.config_loader import Config"
+python -c "from src.orchestrator import Orchestrator"
+python -c "from main import main"
+echo "  Imports: OK"
+echo ""
+
+# 3. Run unit tests
+echo "[3/4] Running unit tests..."
+python -m pytest tests/ --ignore=tests/test_ui_e2e.py -q
+echo ""
+
+# 4. CLI smoke test
+echo "[4/4] Verifying CLI..."
+python main.py --help > /dev/null
+python main.py run --help > /dev/null
+python main.py test-api --help > /dev/null
+echo "  CLI: OK"
+echo ""
+
+echo "=== All checks passed ==="

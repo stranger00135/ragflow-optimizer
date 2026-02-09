@@ -63,12 +63,59 @@ class Config:
         self.data = load_config(config_path)
         self.project_root = get_project_root()
 
+    # Backend configuration properties
+    @property
+    def backend_type(self) -> str:
+        """Get the configured backend type."""
+        backend_section = self.data.get("backend", {})
+        if isinstance(backend_section, dict):
+            return backend_section.get("type", "ragflow")
+        return str(backend_section) if backend_section else "ragflow"
+
+    @property
+    def backend_config(self) -> Dict[str, Any]:
+        """Get the configuration for the current backend type."""
+        backend_type = self.backend_type
+        backend_section = self.data.get("backend", {})
+        if not isinstance(backend_section, dict):
+            backend_section = {}
+
+        # Get backend-specific config from nested section
+        config = backend_section.get(backend_type, {})
+
+        # Fall back to legacy ragflow section for backward compatibility
+        if backend_type == "ragflow" and not config:
+            config = {
+                "base_url": self.ragflow_base_url,
+                "api_key": self.ragflow_api_key,
+            }
+
+        # Add max_retries from retry section
+        config["max_retries"] = self.max_retries
+
+        return config
+
+    # Legacy RAGFlow properties (kept for backward compatibility)
     @property
     def ragflow_base_url(self) -> str:
+        # First check backend.ragflow, then fall back to legacy ragflow section
+        backend_section = self.data.get("backend", {})
+        if not isinstance(backend_section, dict):
+            backend_section = {}
+        backend_ragflow = backend_section.get("ragflow", {})
+        if backend_ragflow.get("base_url"):
+            return backend_ragflow.get("base_url")
         return self.data.get("ragflow", {}).get("base_url", "http://localhost/")
 
     @property
     def ragflow_api_key(self) -> str:
+        # First check backend.ragflow, then fall back to legacy ragflow section
+        backend_section = self.data.get("backend", {})
+        if not isinstance(backend_section, dict):
+            backend_section = {}
+        backend_ragflow = backend_section.get("ragflow", {})
+        if backend_ragflow.get("api_key"):
+            return backend_ragflow.get("api_key")
         return self.data.get("ragflow", {}).get("api_key", "")
 
     @property
@@ -114,6 +161,15 @@ class Config:
     @property
     def distractor_kb_name(self) -> str:
         return self.data.get("distractor_kb", {}).get("name", "eval_distractor_kb")
+
+    @property
+    def distractor_ingest_preset(self) -> str:
+        return self.data.get("distractor_kb", {}).get("ingest_preset", "general")
+
+    @property
+    def backend_name(self) -> str:
+        """Alias for backend_type for orchestrator compatibility."""
+        return self.backend_type
 
     def get_preset(self, preset_name: str) -> Dict[str, Any]:
         """Get preset configuration by name."""

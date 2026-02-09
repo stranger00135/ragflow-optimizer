@@ -1,6 +1,22 @@
 # RAG Ingestion Parameter Optimizer Configuration
 
-# RAGFlow settings
+# Backend selection
+# Supported: ragflow, openwebui
+backend:
+  type: "ragflow"
+
+  # RAGFlow-specific settings
+  ragflow:
+    base_url: "${RAGFLOW_DOMAIN}"
+    api_key: "${RAGFLOW_TOKEN}"
+
+  # OpenWebUI-specific settings
+  openwebui:
+    base_url: "${OPENWEBUI_URL}"
+    api_key: "${OPENWEBUI_API_KEY}"
+
+# Legacy RAGFlow settings (for backward compatibility)
+# These are used if backend.ragflow is not defined
 ragflow:
   base_url: "${RAGFLOW_DOMAIN}"
   api_key: "${RAGFLOW_TOKEN}"

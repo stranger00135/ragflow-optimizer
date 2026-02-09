@@ -6,23 +6,36 @@ from pathlib import Path
 
 from src.config_loader import Config
 from src.orchestrator import Orchestrator
+from src.backends.base import BackendError
+from src.backends.registry import get_backend
 from src.cleanup import cleanup_all_temp_kbs, force_cleanup_all_temp_kbs
 from src.ragflow_client import RAGFlowClient
 from src.question_generator import QuestionGenerator
 
 
-def get_config() -> Config:
-    """Load configuration from default paths."""
+def get_config(backend_override: str = None) -> Config:
+    """Load configuration from default paths.
+
+    Args:
+        backend_override: Optional backend type to override config setting
+    """
     project_root = Path(__file__).parent
     config_path = project_root / "config" / "config.yaml"
     env_path = project_root / ".env"
     # Pass env_path if exists, otherwise Config will auto-discover
-    return Config(str(config_path), str(env_path) if env_path.exists() else None)
+    config = Config(str(config_path), str(env_path) if env_path.exists() else None)
+
+    # Override backend type if specified
+    if backend_override:
+        config.data.setdefault("backend", {})["type"] = backend_override
+
+    return config
 
 
 def cmd_run(args):
     """Run full optimization."""
-    config = get_config()
+    backend = getattr(args, 'backend', None)
+    config = get_config(backend_override=backend)
     orchestrator = Orchestrator(config)
 
     try:
@@ -119,36 +132,69 @@ def cmd_generate_questions(args):
 
 def cmd_cleanup(args):
     """Clean up temporary knowledge bases."""
-    config = get_config()
+    backend = getattr(args, 'backend', None)
+    config = get_config(backend_override=backend)
+    backend_name = config.backend_name
 
-    client = RAGFlowClient(
-        base_url=config.ragflow_base_url,
-        api_key=config.ragflow_api_key,
-    )
+    print(f"Backend: {backend_name}")
 
-    if args.force:
-        print("Force cleanup mode: removing ALL temporary KBs (recovery mode)...")
-        deleted = force_cleanup_all_temp_kbs(client)
+    if backend_name == "ragflow":
+        client = RAGFlowClient(
+            base_url=config.ragflow_base_url,
+            api_key=config.ragflow_api_key,
+        )
+
+        if args.force:
+            print("Force cleanup mode: removing ALL temporary KBs (recovery mode)...")
+            deleted = force_cleanup_all_temp_kbs(client)
+        else:
+            print("Cleaning up temporary evaluation knowledge bases...")
+            deleted = cleanup_all_temp_kbs(client)
+
+        print(f"\nDeleted {len(deleted)} knowledge base(s)")
     else:
-        print("Cleaning up temporary evaluation knowledge bases...")
-        deleted = cleanup_all_temp_kbs(client)
-
-    print(f"\nDeleted {len(deleted)} knowledge base(s)")
+        # Use backend abstraction for other backends
+        try:
+            backend_instance = get_backend(config)
+            print(f"Cleanup for {backend_name} backend is limited to API testing.")
+            print("Use the backend's native UI or API for full cleanup.")
+        except BackendError as e:
+            print(f"Cannot connect to backend: {e}")
 
 
 def cmd_test_api(args):
     """Test API connectivity."""
-    from src.api_test import test_api
+    backend_arg = getattr(args, 'backend', None)
+    config = get_config(backend_override=backend_arg)
+    backend_name = config.backend_name
 
-    project_root = Path(__file__).parent
-    config_path = project_root / "config" / "config.yaml"
-    env_path = project_root / ".env"
+    print(f"Testing {backend_name} backend connectivity...")
 
-    success = test_api(
-        str(config_path),
-        str(env_path) if env_path.exists() else None,
-    )
-    sys.exit(0 if success else 1)
+    if backend_name == "ragflow":
+        project_root = Path(__file__).parent
+        config_path = project_root / "config" / "config.yaml"
+        env_path = project_root / ".env"
+
+        from src.api_test import test_api
+
+        success = test_api(
+            str(config_path),
+            str(env_path) if env_path.exists() else None,
+        )
+        sys.exit(0 if success else 1)
+
+    try:
+        backend = get_backend(config)
+        success = backend.test_connection()
+        if success:
+            print(f"  {backend_name.upper()} API: OK")
+        else:
+            print(f"  {backend_name.upper()} API: FAILED")
+        sys.exit(0 if success else 1)
+    except BackendError as exc:
+        print(f"  {backend_name.upper()} API: FAILED")
+        print(f"  Error: {exc}")
+        sys.exit(1)
 
 
 def main():
@@ -157,11 +203,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python main.py run                    Run full optimization on all folders
-  python main.py run --folder "docs"    Optimize specific folder
-  python main.py generate-questions     Generate questions only
-  python main.py cleanup                Remove temporary KBs
-  python main.py test-api               Test API connectivity
+  python main.py run                         Run full optimization on all folders
+  python main.py run --folder "docs"         Optimize specific folder
+  python main.py run --backend openwebui     Use OpenWebUI backend
+  python main.py generate-questions          Generate questions only
+  python main.py cleanup                     Remove temporary KBs
+  python main.py test-api                    Test API connectivity
+  python main.py test-api --backend openwebui Test OpenWebUI connectivity
         """,
     )
 
@@ -179,6 +227,13 @@ Examples:
         "--keep-kbs",
         action="store_true",
         help="Keep temporary knowledge bases after run",
+    )
+    run_parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["ragflow", "openwebui"],
+        default=None,
+        help="Backend to use (overrides config.yaml setting)",
     )
     run_parser.set_defaults(func=cmd_run)
 
@@ -216,12 +271,26 @@ Examples:
         action="store_true",
         help="Force cleanup ALL temp KBs including from registry (recovery mode)",
     )
+    cleanup_parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["ragflow", "openwebui"],
+        default=None,
+        help="Backend to use (overrides config.yaml setting)",
+    )
     cleanup_parser.set_defaults(func=cmd_cleanup)
 
     # test-api command
     test_parser = subparsers.add_parser(
         "test-api",
         help="Test API connectivity",
+    )
+    test_parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["ragflow", "openwebui"],
+        default=None,
+        help="Backend to test (overrides config.yaml setting)",
     )
     test_parser.set_defaults(func=cmd_test_api)
 

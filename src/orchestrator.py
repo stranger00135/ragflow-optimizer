@@ -22,13 +22,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .backends.base import BackendError
+from .backends.registry import get_backend
 from .config_loader import Config
-from .ingestion_engine import IngestionEngine
 from .metrics import calculate_experiment_metrics, enrich_results_with_metrics
 from .question_generator import QuestionGenerator
-from .ragflow_client import RAGFlowClient, RAGFlowAPIError
 from .relevance_judge import RelevanceJudge
-from .retrieval_engine import RetrievalEngine
 
 
 # Global orchestrator reference for signal handler
@@ -65,14 +64,8 @@ class Orchestrator:
 
         self.config = config
 
-        self.client = RAGFlowClient(
-            base_url=config.ragflow_base_url,
-            api_key=config.ragflow_api_key,
-            max_retries=config.max_retries,
-        )
-
-        self.ingestion_engine = IngestionEngine(self.client)
-        self.retrieval_engine = RetrievalEngine(self.client)
+        self.backend = get_backend(config)
+        self.backend_name = config.backend_name
 
         self.question_generator = QuestionGenerator(
             api_key=config.llm_api_key,
@@ -139,7 +132,7 @@ class Orchestrator:
         # Clean up current folder KB
         if self._current_folder_kb_id:
             try:
-                self.ingestion_engine.cleanup_kb(self._current_folder_kb_id)
+                self.backend.delete_collection(self._current_folder_kb_id)
                 deleted += 1
                 print(f"  Deleted current folder KB")
             except Exception:
@@ -148,7 +141,7 @@ class Orchestrator:
         # Clean up all created KBs
         for kb_id in self.created_kbs:
             try:
-                self.ingestion_engine.cleanup_kb(kb_id)
+                self.backend.delete_collection(kb_id)
                 deleted += 1
             except Exception:
                 pass
@@ -205,12 +198,17 @@ class Orchestrator:
 
     def test_api_connectivity(self) -> bool:
         """Test that all required APIs are working."""
-        print("Testing RAGFlow API connectivity...")
+        print(f"Testing {self.backend_name} backend connectivity...")
 
-        if not self.client.test_connection():
-            raise RAGFlowAPIError("Cannot connect to RAGFlow API. Check base_url and api_key.")
+        try:
+            connected = self.backend.test_connection()
+        except BackendError as exc:
+            raise BackendError(f"Cannot connect to backend: {exc}") from exc
 
-        print("  RAGFlow API: OK")
+        if not connected:
+            raise BackendError("Cannot connect to backend. Check configuration and credentials.")
+
+        print("  Backend API: OK")
 
         try:
             self.question_generator.client.chat.completions.create(
@@ -220,26 +218,91 @@ class Orchestrator:
             )
             print("  LLM API: OK")
         except Exception as e:
-            raise RAGFlowAPIError(f"Cannot connect to LLM API: {e}")
+            raise BackendError(f"Cannot connect to LLM API: {e}")
 
         return True
 
-    def setup_distractor_kb(self) -> str:
-        """Set up the distractor knowledge base."""
-        print("Setting up distractor knowledge base...")
+    def setup_distractor_kb(self) -> Optional[str]:
+        """Set up the distractor collection."""
+        print("Setting up distractor collection...")
 
-        preset_config = self.config.get_preset("general")
+        if not self.config.distractors_path.exists():
+            print("  Distractors path not found; skipping distractor setup.")
+            self.distractor_kb_id = None
+            return None
 
-        self.distractor_kb_id = self.ingestion_engine.setup_distractor_kb(
-            name=self.distractor_kb_name,
-            distractors_path=self.config.distractors_path,
-            preset_config=preset_config,
+        preset_name = self.config.distractor_ingest_preset
+        preset_config = self.config.get_preset(preset_name)
+
+        existing = self.backend.get_collection_by_name(self.distractor_kb_name)
+        if existing:
+            existing_id = existing.get("id") or existing.get("collection_id")
+            if existing_id:
+                stats = self.backend.get_collection_stats(existing_id)
+                if stats.get("chunk_count", 0) > 0:
+                    print(f"  Reusing existing distractor collection: {self.distractor_kb_name}")
+                    self.distractor_kb_id = existing_id
+                    return self.distractor_kb_id
+                self.backend.delete_collection(existing_id)
+
+        self.distractor_kb_id = self.backend.create_collection(self.distractor_kb_name, preset_config)
+
+        upload_result = self.backend.upload_documents(self.distractor_kb_id, self.config.distractors_path)
+        if upload_result.get("uploaded_files", 0) == 0:
+            print("  Warning: No distractor files uploaded.")
+        else:
+            print(
+                f"  Uploaded {upload_result.get('uploaded_files', 0)}/"
+                f"{upload_result.get('total_files', 0)} distractor files"
+            )
+
+        self.backend.ingest_with_config(
+            collection_id=self.distractor_kb_id,
+            config=preset_config,
+            timeout=900,
         )
 
-        stats = self.ingestion_engine.get_kb_stats(self.distractor_kb_id)
-        print(f"  Distractor KB ready: {stats.get('chunk_count', 0)} chunks")
+        stats = self.backend.get_collection_stats(self.distractor_kb_id)
+        print(f"  Distractor collection ready: {stats.get('chunk_count', 0)} chunks")
 
         return self.distractor_kb_id
+
+    def _retrieve_for_evaluation(
+        self,
+        questions: List[Dict[str, Any]],
+        target_kb_id: str,
+        distractor_kb_id: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Retrieve chunks for evaluation questions using the configured backend."""
+        dataset_ids = [target_kb_id]
+        if distractor_kb_id:
+            dataset_ids.append(distractor_kb_id)
+
+        results = []
+        for q in questions:
+            question_text = q.get("question", "")
+            question_id = q.get("question_id", "")
+
+            chunks = self.backend.retrieve(
+                query=question_text,
+                collection_ids=dataset_ids,
+                top_k=self.config.top_k,
+                similarity_threshold=self.config.similarity_threshold,
+            )
+
+            for chunk in chunks:
+                dataset_id = chunk.get("dataset_id") or chunk.get("collection_id") or ""
+                chunk["dataset_id"] = dataset_id
+                chunk["collection_id"] = chunk.get("collection_id") or dataset_id
+                chunk["from_distractor"] = bool(distractor_kb_id and dataset_id == distractor_kb_id)
+
+            results.append({
+                "question_id": question_id,
+                "question": question_text,
+                "chunks_retrieved": chunks,
+            })
+
+        return results
 
     def run_single_experiment_v4(
         self,
@@ -275,9 +338,9 @@ class Orchestrator:
 
         try:
             # v4: Re-ingest with new config instead of creating new KB
-            ingestion_result = self.ingestion_engine.reingest_with_config(
-                dataset_id=dataset_id,
-                preset_config=preset_config,
+            ingestion_result = self.backend.ingest_with_config(
+                collection_id=dataset_id,
+                config=preset_config,
                 timeout=600,
             )
 
@@ -293,9 +356,7 @@ class Orchestrator:
             }
 
             # v4: Validate ingestion and check for disqualification
-            is_valid, disqualification_reason = self.ingestion_engine.validate_ingestion(
-                ingestion_result
-            )
+            is_valid, disqualification_reason = self.backend.validate_ingestion(ingestion_result)
 
             if not is_valid:
                 # Experiment disqualified - skip retrieval
@@ -327,12 +388,10 @@ class Orchestrator:
             # Ingestion valid - proceed with retrieval
             chunk_count = ingestion_details["chunk_count"]
 
-            retrieval_results = self.retrieval_engine.retrieve_for_evaluation(
+            retrieval_results = self._retrieve_for_evaluation(
                 questions=questions,
                 target_kb_id=dataset_id,
                 distractor_kb_id=self.distractor_kb_id,
-                top_k=self.config.top_k,
-                similarity_threshold=self.config.similarity_threshold,
             )
 
             judged_results = self.relevance_judge.judge_retrieval_results(
@@ -373,7 +432,7 @@ class Orchestrator:
 
             return experiment_result
 
-        except RAGFlowAPIError as e:
+        except BackendError as e:
             print(f"      ERROR: {e}")
             return {
                 "experiment_id": experiment_id,
@@ -586,24 +645,24 @@ class Orchestrator:
         folder_hash = hashlib.md5(relative_path.encode()).hexdigest()[:8]
         kb_name = f"eval_temp_{folder_hash}"
 
-        dataset_id = self.ingestion_engine.create_reusable_kb(kb_name)
+        dataset_id = self.backend.create_collection(kb_name, {})
         self._current_folder_kb_id = dataset_id
         self._current_folder_path = relative_path
-        self._current_embedding_model = self.client.get_embedding_model(dataset_id)
+        self._current_embedding_model = self.backend.get_embedding_model(dataset_id)
         self.created_kbs.append(dataset_id)
         self._save_cleanup_registry()
 
         # v4: Upload files once
         print(f"  Uploading files to temp KB...")
-        upload_result = self.ingestion_engine.upload_folder_once(
-            dataset_id=dataset_id,
+        upload_result = self.backend.upload_documents(
+            collection_id=dataset_id,
             folder_path=folder_path,
         )
 
         if upload_result["uploaded_files"] == 0:
             print(f"  No files uploaded, skipping folder")
             # Clean up KB
-            self.ingestion_engine.cleanup_kb(dataset_id)
+            self.backend.delete_collection(dataset_id)
             self.created_kbs.remove(dataset_id)
             self._current_folder_kb_id = None
             return {
@@ -658,7 +717,7 @@ class Orchestrator:
         finally:
             # v4: Clean up folder's temp KB after all experiments
             print(f"  Cleaning up folder temp KB...")
-            self.ingestion_engine.cleanup_kb(dataset_id)
+            self.backend.delete_collection(dataset_id)
             if dataset_id in self.created_kbs:
                 self.created_kbs.remove(dataset_id)
             self._current_folder_kb_id = None
@@ -724,7 +783,7 @@ class Orchestrator:
                 # Ensure cleanup on error
                 if self._current_folder_kb_id:
                     try:
-                        self.ingestion_engine.cleanup_kb(self._current_folder_kb_id)
+                        self.backend.delete_collection(self._current_folder_kb_id)
                         if self._current_folder_kb_id in self.created_kbs:
                             self.created_kbs.remove(self._current_folder_kb_id)
                     except Exception:
@@ -1041,13 +1100,13 @@ class Orchestrator:
 
         for kb_id in self.created_kbs:
             try:
-                self.ingestion_engine.cleanup_kb(kb_id)
+                self.backend.delete_collection(kb_id)
             except Exception:
                 pass
 
         if include_distractor and self.distractor_kb_id:
             try:
-                self.ingestion_engine.cleanup_kb(self.distractor_kb_id)
+                self.backend.delete_collection(self.distractor_kb_id)
             except Exception:
                 pass
 
